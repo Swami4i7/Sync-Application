@@ -6,10 +6,19 @@ import {
     parseAsInteger,
     parseAsString,
 } from 'nuqs/server'
-import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "crypto";
+import * as libsodium from "libsodium-wrappers";
 import { axiosInstance } from "@/api/axios";
 import env from "@/api/env";
 
+let sodiumInstance: typeof libsodium | null = null;
+
+async function getSodiumInstance(): Promise<typeof libsodium> {
+  if (!sodiumInstance) {
+    await libsodium.ready;
+    sodiumInstance = libsodium;
+  }
+  return sodiumInstance;
+}
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
@@ -69,7 +78,8 @@ export const errorLogsProps = {
 
 export const errorLogsPropsCache = createSearchParamsCache(errorLogsProps);
 
-export function generateHMAC(method: string, url: string, body: string = ""): { signature: string; timestamp: number } {
+export async function generateHMAC(method: string, url: string, body: string = ""): Promise<{ signature: string; timestamp: number }> {
+  const sodium = await getSodiumInstance();
   const SECRET_KEY: string | undefined = env.NEXT_PUBLIC_HMAC_SECRET;
   const timestamp: number = Date.now();
   const baseUrlWithoutApi = axiosInstance.defaults.baseURL?.replace('/api/sync', '') ?? '';
@@ -78,45 +88,47 @@ export function generateHMAC(method: string, url: string, body: string = ""): { 
   if (!SECRET_KEY) {
     throw new Error("HMAC_SECRET is not defined in environment variables");
   }
-  const signature: string = createHmac("sha256", SECRET_KEY)
-    .update(data)
-    .digest("hex");
+  const keyBytes = sodium.from_string(SECRET_KEY);
+  const dataBytes = sodium.from_string(data);
+  const signatureBytes = sodium.crypto_auth(dataBytes, keyBytes);
+  const signature: string = sodium.to_hex(signatureBytes);
   return { signature, timestamp };
 }
 
-export function encryptBody(data: string): { ciphertext: string; iv: string } {
+export async function encryptBody(data: string): Promise<{ ciphertext: string; iv: string }> {
+  const sodium = await getSodiumInstance();
   const HMAC_SECRET: string = env.NEXT_PUBLIC_HMAC_SECRET || "";
   const PUBLIC_KEY_VALUE: string = env.NEXT_PUBLIC_KEY || "";
   if (!HMAC_SECRET || !PUBLIC_KEY_VALUE) {
     throw new Error("HMAC_SECRET or PUBLIC_KEY_VALUE is not defined");
   }
-  const AES_KEY: Buffer = createHash("sha256")
-  .update(HMAC_SECRET + PUBLIC_KEY_VALUE)
-  .digest();
+  const keyInput = sodium.from_string(HMAC_SECRET + PUBLIC_KEY_VALUE);
+  const AES_KEY = sodium.crypto_generichash(32, keyInput);
 
-  const iv = randomBytes(16);
-  const cipher = createCipheriv("aes-256-cbc", AES_KEY, iv);
-  let encrypted = cipher.update(data, "utf8", "hex");
-  encrypted += cipher.final("hex");
+  const iv = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
+  const message = sodium.from_string(data);
+  const ciphertext = sodium.crypto_secretbox_easy(message, iv, AES_KEY);
   return {
-    ciphertext: encrypted,
-    iv: iv.toString("hex"),
+    ciphertext: sodium.to_hex(ciphertext),
+    iv: sodium.to_hex(iv),
   };
 }
 
-export function decryptBody(ciphertext: string, iv: string): string {
+export async function decryptBody(ciphertext: string, iv: string): Promise<string> {
+    const sodium = await getSodiumInstance();
     const HMAC_SECRET: string = env.NEXT_PUBLIC_HMAC_SECRET || "";
     const PUBLIC_KEY_VALUE: string = env.NEXT_PUBLIC_KEY || "";
     if (!HMAC_SECRET || !PUBLIC_KEY_VALUE) {
       throw new Error("HMAC_SECRET or PUBLIC_KEY_VALUE is not defined");
     }
 
-    const AES_KEY: Buffer = createHash("sha256")
-      .update(HMAC_SECRET + PUBLIC_KEY_VALUE)
-      .digest();
-    const decipher = createDecipheriv("aes-256-cbc", AES_KEY, Buffer.from(iv, "hex"));
-    let decrypted = decipher.update(ciphertext, "hex", "utf8");
-    decrypted += decipher.final("utf8");
-    return decrypted;
+    const keyInput = sodium.from_string(HMAC_SECRET + PUBLIC_KEY_VALUE);
+    const AES_KEY = sodium.crypto_generichash(32, keyInput);
+    const ivBytes = sodium.from_hex(iv);
+    const cipherBytes = sodium.from_hex(ciphertext);
+    const decrypted = sodium.crypto_secretbox_open_easy(cipherBytes, ivBytes, AES_KEY);
+    if (decrypted === null) {
+      throw new Error("Decryption failed");
+    }
+    return sodium.to_string(decrypted);
 }
-
